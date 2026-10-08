@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the app and wraps it into build/bgpbar.app. Pass --install to copy it to ~/Applications and (re)start it.
+# Builds the app and wraps it into build/bgpbar.app. Pass --run to (re)start it.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -33,10 +33,8 @@ PLIST
 codesign --force --sign - "$APP"
 echo "Built $APP"
 
-if [ "${1:-}" = "--install" ]; then
+# ~/Applications/bgpbar.app links here (mac-and-conf [tools.bgpbar]); --run restarts it from the fresh build.
+if [ "${1:-}" = "--run" ]; then
     pkill -x bgpbar || true
-    rm -rf ~/Applications/bgpbar.app
-    cp -R "$APP" ~/Applications/
-    open ~/Applications/bgpbar.app
-    echo "Installed ~/Applications/bgpbar.app"
+    open "$APP"
 fi

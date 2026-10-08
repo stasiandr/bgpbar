@@ -9,6 +9,8 @@ and a macOS menu bar view of its tasks. Reads `~/.claude/progress/*.json` every 
   last output line. Click a row to open its log; hover for stop (SIGINT) / dismiss.
 - Notification when a task finishes (sound on failure). "При входе" toggles launch at login.
 
-    ./scripts/bundle.sh --install   # build, copy to ~/Applications, restart
+    ./scripts/bundle.sh --run   # build and restart
+
+Installed by mac-and-conf (`[tools.bgpbar]` links `~/Applications/bgpbar.app` and `~/.local/bin/bgp` here).
 
 Install the CLI: `ln -s "$PWD/bin/bgp" ~/.local/bin/bgp`.
