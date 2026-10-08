@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""bgp — run a long command and report its progress.
+
+  bgp [-l LABEL] [-e ETA] [-t TOTAL] [-c REGEX] [-i SEC] [-v] -- CMD ...
+  bgp status            # show all running / recent bgp tasks
+  bgp watch [LABEL]     # for Monitor: a line per 25% milestone + one at the end
+
+Runs CMD in a pseudo-terminal, so tools that buffer output or hide progress
+bars when not attached to a TTY still print them. Parses progress from the
+output (pytest [ 45%], tqdm, curl, N/M counters, percentages, 1.2GB/4.5GB)
+and every INTERVAL seconds prints a compact block sized for the Desktop
+Tasks pane:
+
+  ██████████░░░░░░  62%
+  124/200 · 25s · ещё ~15s
+  › processed 120/200 fil…
+
+CMD output goes only to ~/.claude/progress/<id>.log unless -v is given; state
+is kept in <id>.json (updated every second). Without parseable progress the
+bar shows elapsed time against the -e guess (▒). Exits with CMD's exit code.
+"""
+import argparse, json, os, pty, re, select, signal, subprocess, sys, time
+from pathlib import Path
+
+PROGRESS_DIR = Path.home() / ".claude" / "progress"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
+
+PYTEST = re.compile(r"\[\s*(\d{1,3})%\]")
+PYTEST_RESULT = re.compile(r"::\S+.*?\b(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\b|\b(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\s+\S+::")
+PYTEST_SUMMARY_FAILED = re.compile(r"(\d+) (?:failed|errors?)\b.* in [\d.]+s")
+PYTEST_COLLECTED = re.compile(r"collected (\d+) items?|workers \[(\d+) items?\]")
+TQDM = re.compile(r"(\d{1,3})%\|.*?\|\s*([\d.]+[kMG]?)/([\d.]+[kMG]?)\s*\[[\d:]+<([\d:]+|\?)")
+CURL = re.compile(r"^(\d{1,3})\s+[\d.]+[kMGT]?\s+(\d{1,3})\s+[\d.]+[kMGT]?\s+\d+\s+[\d.]+[kMGT]?\s")
+BYTES = re.compile(r"([\d.]+)\s*([kKMGT]i?B|B)\s*/\s*([\d.]+)\s*([kKMGT]i?B|B)\b")
+FRACTION = re.compile(r"(?<![\d./:-])(\d+)\s*/\s*(\d+)(?![\d./:-])")
+PERCENT = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d+)?)\s?%")
+
+
+def parse_duration(s):
+    if not s:
+        return None
+    total, found = 0.0, False
+    for num, unit in re.findall(r"([\d.]+)\s*([hms]?)", s):
+        total += float(num) * {"h": 3600, "m": 60, "s": 1, "": 60}[unit]
+        found = True
+    return total if found else None
+
+
+def parse_clock(s):  # "01:23" or "1:02:03" -> seconds
+    parts = [int(p) for p in s.split(":")]
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + p
+    return secs
+
+
+def to_bytes(num, unit):
+    base = 1024 if "i" in unit else 1000
+    power = "bkmgt".index(unit[0].lower())
+    return float(num) * base ** power
+
+
+def fmt_dur(s):
+    s = int(max(0, s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}B"
+        n /= 1000
+
+
+class Tracker:
+    """Keeps the best progress estimate. Higher-rank sources win once seen."""
+
+    def __init__(self, total, count_re):
+        self.frac = None          # 0..1
+        self.done = self.total = None
+        self.unit = ""            # "" for items, "bytes"
+        self.tool_eta = None      # seconds, when the tool reports it itself
+        self.rank = 0
+        self.failures = 0
+        self.count_re = re.compile(count_re) if count_re else None
+        self.user_total = total
+        self.counted = 0
+        self.tests_done = 0
+        self.history = []         # (t, frac)
+        self.last_line = ""
+
+    def _set(self, rank, frac, done=None, total=None, unit="", eta=None):
+        if rank < self.rank or frac is None or not 0 <= frac <= 1:
+            return
+        self.rank, self.frac, self.done, self.total = rank, frac, done, total
+        self.unit, self.tool_eta = unit, eta
+        now = time.time()
+        if not self.history or self.history[-1][1] != frac:
+            self.history.append((now, frac))
+            self.history = [h for h in self.history if now - h[0] < 300] or [(now, frac)]
+
+    def feed(self, text):
+        text = ANSI.sub("", text).strip()
+        if not text:
+            return
+        self.last_line = text[:160]
+        if m := PYTEST_SUMMARY_FAILED.search(text):
+            self.failures = int(m.group(1))
+        if self.count_re and self.count_re.search(text):
+            self.counted += 1
+            if self.user_total:
+                self._set(5, min(1, self.counted / self.user_total), self.counted, self.user_total)
+            return
+        if m := PYTEST_COLLECTED.search(text):
+            self.user_total = self.user_total or int(m.group(1) or m.group(2))
+        if (m := PYTEST.search(text)) and (text.rstrip().endswith("%]") or PYTEST_RESULT.search(text)):
+            if r := PYTEST_RESULT.search(text):
+                self.tests_done += 1
+                if (r.group(1) or r.group(2)) in ("FAILED", "ERROR"):
+                    self.failures += 1
+            pct, tot = int(m.group(1)) / 100, self.user_total
+            if tot and self.tests_done:
+                self._set(4, min(1, self.tests_done / tot), self.tests_done, tot)
+            else:
+                self._set(4, pct, round(pct * tot) if tot else None, tot)
+            return
+        if m := TQDM.search(text):
+            eta = None if m.group(4) == "?" else parse_clock(m.group(4))
+            self._set(4, int(m.group(1)) / 100, m.group(2), m.group(3), eta=eta)
+            return
+        if m := CURL.search(text):
+            self._set(3, int(m.group(2)) / 100)
+            return
+        if m := BYTES.search(text):
+            a, b = to_bytes(m.group(1), m.group(2)), to_bytes(m.group(3), m.group(4))
+            if 0 < b and a <= b:
+                self._set(2, a / b, a, b, unit="bytes")
+                return
+        for m in FRACTION.finditer(text):
+            a, b = int(m.group(1)), int(m.group(2))
+            if 2 <= b and a <= b:
+                self._set(1, a / b, a, b)
+                return
+        if m := PERCENT.search(text):
+            self._set(1, float(m.group(1)) / 100)
+
+    def eta(self):
+        if self.tool_eta is not None:
+            return self.tool_eta
+        if self.frac is None or len(self.history) < 2:
+            return None
+        (t0, f0), (t1, f1) = self.history[0], self.history[-1]
+        if f1 <= f0 or t1 <= t0:
+            return None
+        rate = (f1 - f0) / (t1 - t0)
+        return (1 - self.frac) / rate
+
+
+BAR_W = 16
+LINE_W = 24  # the Desktop Tasks pane wraps at ~26 chars
+
+
+def bar(frac, estimated=False):
+    filled = round(max(0, min(1, frac)) * BAR_W)
+    return ("▒" if estimated else "█") * filled + "░" * (BAR_W - filled)
+
+
+def clip(text, width=LINE_W):
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def counts(tr):
+    if tr.unit == "bytes":
+        return f"{fmt_bytes(tr.done)}/{fmt_bytes(tr.total)}"
+    if tr.done is not None and tr.total is not None:
+        return f"{tr.done}/{tr.total}"
+    return None
+
+
+def oneline(label, tr, elapsed, guess):
+    """Single-line summary for bgp status / watch / the state file."""
+    parts = [label]
+    if tr.frac is not None:
+        parts.append(f"{tr.frac * 100:.0f}%")
+        if c := counts(tr):
+            parts.append(c)
+        eta = tr.eta() if tr.frac < 1 else None
+        if eta is not None:
+            parts.append(f"ещё ~{fmt_dur(eta)}")
+    elif guess:
+        parts.append(f"{fmt_dur(elapsed)} из ~{fmt_dur(guess)} (оценка)")
+    else:
+        parts.append(fmt_dur(elapsed))
+    if tr.failures:
+        parts.append(f"✗ {tr.failures} failed")
+    return " · ".join(parts)
+
+
+def block(tr, elapsed, guess):
+    """Compact multi-line status sized for the narrow Tasks pane."""
+    if tr.frac is not None:
+        lines = [f"{bar(tr.frac)} {tr.frac * 100:3.0f}%"]
+        info = [c] if (c := counts(tr)) else []
+        info.append(fmt_dur(elapsed))
+        eta = tr.eta() if tr.frac < 1 else None
+        info.append(f"ещё ~{fmt_dur(eta)}" if eta is not None else "ещё ?")
+        lines.append(" · ".join(info))
+    elif guess:
+        f = elapsed / guess
+        lines = [f"{bar(min(f, 1), estimated=True)} ~{min(f, 1) * 100:.0f}%"]
+        if elapsed - guess < 1:
+            lines.append(f"{fmt_dur(elapsed)} из ~{fmt_dur(guess)}")
+        else:
+            lines.append(f"{fmt_dur(elapsed)} · дольше на {fmt_dur(elapsed - guess)}")
+    else:
+        lines = [f"⏳ {fmt_dur(elapsed)}"]
+    if tr.failures:
+        lines.append(f"✗ {tr.failures} failed")
+    if tr.last_line:
+        lines.append(clip("› " + tr.last_line))
+    return "\n".join(clip(l) for l in lines)
+
+
+def write_state(path, **state):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False))
+    tmp.replace(path)
+
+
+def cmd_status():
+    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for f in sorted(PROGRESS_DIR.glob("*.json")):
+        try:
+            st = json.loads(f.read_text())
+        except Exception:
+            continue
+        alive = st.get("status") == "running"
+        if alive:
+            try:
+                os.kill(st["pid"], 0)
+            except OSError:
+                alive, st["status"] = False, "died"
+        if alive or time.time() - st.get("updated", 0) < 3600:
+            rows.append(f"[{st['status']}] {st['summary']}\n    log: {f.with_suffix('.log')}")
+    print("\n".join(rows) if rows else "нет активных задач bgp")
+
+
+def cmd_watch(label=None, poll=2.0):
+    """Print one line at every 25% milestone and at the end; exit when all watched tasks end.
+
+    Meant as a Monitor command: `bgp watch [LABEL]`.
+    """
+    seen, marks = {}, {}
+    deadline = time.time() + 30  # wait up to 30s for a matching task to appear
+    while True:
+        running = 0
+        for f in sorted(PROGRESS_DIR.glob("*.json")):
+            try:
+                st = json.loads(f.read_text())
+            except Exception:
+                continue
+            if label and st.get("label") != label:
+                continue
+            if st["id"] not in seen and st.get("status") != "running":
+                continue  # finished before we started watching
+            seen.setdefault(st["id"], st["started"])
+            marks.setdefault(st["id"], [0.25, 0.5, 0.75])
+            if st.get("status") == "running":
+                try:
+                    os.kill(st["pid"], 0)
+                except OSError:
+                    st["status"] = "died"
+            if st["status"] == "running":
+                running += 1
+                f_ = st.get("frac")
+                if f_ is None and st.get("guess"):
+                    f_ = (time.time() - st["started"]) / st["guess"]
+                hit = False
+                while f_ is not None and marks[st["id"]] and f_ >= marks[st["id"]][0]:
+                    marks[st["id"]].pop(0); hit = True
+                if hit:
+                    print("◆ " + st["summary"], flush=True)
+            elif st["id"] in marks:
+                mark = "✓" if st["status"] == "done" else f"✗ {st['status']}"
+                took = fmt_dur(st["updated"] - st["started"])
+                print(f"{mark} {st['summary']} · за {took}", flush=True)
+                del marks[st["id"]]
+        if seen and not marks:
+            return
+        if not seen and time.time() > deadline:
+            print("bgp watch: задача не найдена", flush=True)
+            return
+        time.sleep(poll)
+
+
+def cleanup_old():
+    for f in PROGRESS_DIR.glob("*"):
+        try:
+            if time.time() - f.stat().st_mtime > 2 * 86400:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def main():
+    if sys.argv[1:2] == ["status"]:
+        return cmd_status()
+    if sys.argv[1:2] == ["watch"]:
+        return cmd_watch(sys.argv[2] if len(sys.argv) > 2 else None)
+    ap = argparse.ArgumentParser(prog="bgp", usage=__doc__.split("\n\n")[1].strip())
+    ap.add_argument("-l", "--label", default=None)
+    ap.add_argument("-e", "--eta", help="a-priori duration guess, e.g. 90s, 4m, 1h30m")
+    ap.add_argument("-t", "--total", type=int, help="number of units expected (with --count)")
+    ap.add_argument("-c", "--count", help="regex; each matching output line is one done unit")
+    ap.add_argument("-i", "--interval", type=float, default=10)
+    ap.add_argument("-v", "--verbose", action="store_true", help="also pass CMD output through (always logged)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="default; kept for compatibility")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        ap.error("no command given")
+    label = a.label or os.path.basename(cmd[0])
+    guess = parse_duration(a.eta)
+
+    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_old()
+    tid = f"{re.sub(r'[^A-Za-z0-9_-]+', '-', label)[:40]}-{os.getpid()}"
+    state_path, log_path = PROGRESS_DIR / f"{tid}.json", PROGRESS_DIR / f"{tid}.log"
+    log = open(log_path, "wb")
+
+    master, slave = pty.openpty()
+    try:
+        import fcntl, struct, termios
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
+    except Exception:
+        pass
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
+                            env=env, start_new_session=True)
+    os.close(slave)
+
+    def forward(sig, _):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            pass
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, forward)
+
+    tr = Tracker(a.total, a.count)
+    start = last_report = last_state = time.time()
+    buf = b""
+    out = sys.stdout.buffer
+    print(f"▶ {clip(label)}" + (f"\nоценка ~{fmt_dur(guess)}" if guess else ""), flush=True)
+
+    def save(status="running"):
+        write_state(state_path, id=tid, label=label, pid=os.getpid(), cmd=cmd, status=status,
+                    started=start, updated=time.time(), frac=tr.frac, eta=tr.eta(),
+                    guess=guess, failures=tr.failures, last_line=tr.last_line, counts=counts(tr),
+                    cwd=os.getcwd(),
+                    summary=oneline(label, tr, time.time() - start, guess))
+
+    save()
+    while True:
+        try:
+            r, _, _ = select.select([master], [], [], 1.0)
+            chunk = os.read(master, 65536) if r else None
+        except OSError:
+            chunk = b""
+        if chunk == b"":
+            break
+        if chunk:
+            log.write(chunk)
+            buf += chunk.replace(b"\r\n", b"\n")
+            # \n ends a line; a bare \r redraws it (progress bars): parsed, never echoed
+            while m := re.search(rb"[\r\n]", buf):
+                piece, sep, buf = buf[:m.start()], buf[m.start():m.end()], buf[m.end():]
+                txt = ANSI.sub("", piece.decode("utf-8", "replace"))
+                tr.feed(txt)
+                if sep == b"\n" and a.verbose:
+                    out.write(txt.encode() + b"\n")
+            if len(buf) > 4096:
+                tr.feed(buf.decode("utf-8", "replace")); buf = b""
+        now = time.time()
+        if now - last_state >= 1:
+            save()
+            last_state = now
+        if now - last_report >= a.interval:
+            out.flush()
+            print("\n" + block(tr, now - start, guess), flush=True)
+            last_report = now
+        if not r and proc.poll() is not None:
+            break
+
+    if buf:
+        tr.feed(buf.decode("utf-8", "replace"))
+    code = proc.wait()
+    log.close()
+    if code == 0 and tr.frac is not None:
+        tr.frac, tr.tool_eta = 1.0, 0
+        if tr.total is not None and tr.unit != "bytes":
+            tr.done = tr.total
+    save("done" if code == 0 else "failed")
+    took = fmt_dur(time.time() - start)
+    lines = [f"✓ готово за {took}" if code == 0 else f"✗ exit {code} за {took}"]
+    if tr.frac is not None and (c := counts(tr)):
+        lines.append(c)
+    if tr.failures:
+        lines.append(f"✗ {tr.failures} failed")
+    if code != 0 and tr.last_line:
+        lines.append(clip("› " + tr.last_line))
+    out.flush()
+    print("\n" + "\n".join(clip(l) for l in lines), flush=True)
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

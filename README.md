@@ -1,6 +1,7 @@
 # bgpbar
 
-Menu bar view for `bgp` (`~/.local/bin/bgp`) tasks. Reads `~/.claude/progress/*.json` every second.
+`bgp` — a progress-reporting wrapper for long background commands (`bin/bgp`, see its docstring) —
+and a macOS menu bar view of its tasks. Reads `~/.claude/progress/*.json` every second.
 
 - Menu bar: percent of the newest running task (`~` = estimated from `-e`), `+N` for more running tasks;
   `!` after a failed/died task, a quiet gauge when idle.
@@ -9,3 +10,5 @@ Menu bar view for `bgp` (`~/.local/bin/bgp`) tasks. Reads `~/.claude/progress/*.
 - Notification when a task finishes (sound on failure). "При входе" toggles launch at login.
 
     ./scripts/bundle.sh --install   # build, copy to ~/Applications, restart
+
+Install the CLI: `ln -s "$PWD/bin/bgp" ~/.local/bin/bgp`.
